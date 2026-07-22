@@ -7,7 +7,7 @@ you enumerate/discover *services* that way. To get real "find nearby
 BTChat instances and connect" behavior, we need the WinRT Bluetooth
 APIs (Windows.Devices.Bluetooth.Rfcomm / Windows.Devices.Enumeration),
 which is exactly what Microsoft's own "Bluetooth Rfcomm Chat Sample"
-uses. We drive them from Python via the `winsdk` package.
+uses. We drive them from Python via the `winrt-*` packages.
 
 Key facts this design relies on (from Microsoft's docs):
   - RfcommServiceProvider advertises a custom service (identified by
@@ -25,7 +25,7 @@ the GUI thread, each BluetoothWorker runs its own asyncio event loop
 inside a QThread and reports back to the GUI via Qt signals (the only
 thread-safe way to touch widgets from a worker thread).
 
-IMPORTANT: `winsdk` is Windows-only and requires Windows 10 1607+.
+IMPORTANT: The `winrt-*` packages are Windows-only and require Windows 10 1607+.
 This module cannot be executed/tested outside Windows - it has been
 written to match Microsoft's documented API shapes as closely as
 possible but has NOT been run against real Bluetooth hardware. If you
@@ -46,9 +46,9 @@ POLL_INTERVAL = 1.0  # seconds; how often loops check for stop/cancel
 
 
 def winrt_bluetooth_available() -> bool:
-    """Best-effort check that the winsdk package is importable here."""
+    """Best-effort check that the winrt Bluetooth packages are importable."""
     try:
-        import winsdk.windows.devices.bluetooth.rfcomm  # noqa: F401
+        import winrt.windows.devices.bluetooth.rfcomm  # noqa: F401
         return True
     except ImportError:
         return False
@@ -116,8 +116,8 @@ class BluetoothWorker(QThread):
     # ---- server (advertise + accept) ------------------------------
 
     async def _run_server(self):
-        from winsdk.windows.devices.bluetooth.rfcomm import RfcommServiceProvider, RfcommServiceId
-        from winsdk.windows.networking.sockets import StreamSocketListener, SocketProtectionLevel
+        from winrt.windows.devices.bluetooth.rfcomm import RfcommServiceProvider, RfcommServiceId
+        from winrt.windows.networking.sockets import StreamSocketListener, SocketProtectionLevel
 
         provider = await RfcommServiceProvider.create_async(RfcommServiceId.from_uuid(BTCHAT_SERVICE_UUID))
         listener = StreamSocketListener()
@@ -130,13 +130,13 @@ class BluetoothWorker(QThread):
 
         token = listener.add_connection_received(on_connection_received)
         try:
-            await listener.bind_service_name_async(
+            await listener.bind_service_name_with_protection_level_async(
                 provider.service_id.as_string(),
                 SocketProtectionLevel.BLUETOOTH_ENCRYPTION_ALLOW_NULL_AUTHENTICATION,
             )
             # radioDiscoverable=True: discoverable by nearby devices
             # without requiring a pre-existing OS pairing bond.
-            provider.start_advertising(listener, True)
+            provider.start_advertising_with_radio_discoverability(listener, True)
             self.listening.emit()
 
             sock = None
@@ -161,9 +161,9 @@ class BluetoothWorker(QThread):
     # ---- client (discover-and-dial or manual MAC) ------------------
 
     async def _run_client(self):
-        from winsdk.windows.devices.bluetooth.rfcomm import RfcommDeviceService, RfcommServiceId
-        from winsdk.windows.devices.bluetooth import BluetoothDevice
-        from winsdk.windows.networking.sockets import StreamSocket, SocketProtectionLevel
+        from winrt.windows.devices.bluetooth.rfcomm import RfcommDeviceService, RfcommServiceId
+        from winrt.windows.devices.bluetooth import BluetoothDevice
+        from winrt.windows.networking.sockets import StreamSocket, SocketProtectionLevel
 
         service = None
         if self.target_device_id:
@@ -184,7 +184,7 @@ class BluetoothWorker(QThread):
             raise RuntimeError("No target device specified.")
 
         sock = StreamSocket()
-        await sock.connect_async(
+        await sock.connect_with_protection_level_async(
             service.connection_host_name,
             service.connection_service_name,
             SocketProtectionLevel.BLUETOOTH_ENCRYPTION_ALLOW_NULL_AUTHENTICATION,
@@ -194,12 +194,12 @@ class BluetoothWorker(QThread):
     # ---- shared read/write loop -------------------------------------
 
     async def _handle_socket(self, sock):
-        from winsdk.windows.storage.streams import DataReader, DataWriter, ByteOrder
+        from winrt.windows.storage.streams import DataReader, DataWriter, ByteOrder, UnicodeEncoding
 
         self._writer = DataWriter(sock.output_stream)
         reader = DataReader(sock.input_stream)
         reader.byte_order = ByteOrder.BIG_ENDIAN
-        reader.unicode_encoding = 0  # UTF8, matches winsdk's UnicodeEncoding.UTF8 value
+        reader.unicode_encoding = UnicodeEncoding.UTF8
 
         self.connected.emit(self._peer_label)
         await self._send_envelope(make_hello(self.local_id, self.display_name))

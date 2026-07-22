@@ -13,7 +13,7 @@ lets RFCOMM custom services connect without a pre-existing OS pairing
 bond, but some security policies still require one. `pair_device()`
 triggers Windows' native pairing flow when needed.
 
-NOTE: same caveat as transport.py - `winsdk`/WinRT only runs on
+NOTE: same caveat as transport.py - `winrt-*`/WinRT only runs on
 Windows and hasn't been exercised against real hardware from this
 environment.
 """
@@ -30,12 +30,12 @@ async def scan_for_btchat_devices(timeout: float = 8.0):
     `id` is a WinRT DeviceInformation.Id - pass it back into
     BluetoothWorker(target_device_id=...) to connect.
     """
-    from winsdk.windows.devices.bluetooth.rfcomm import RfcommDeviceService, RfcommServiceId
-    from winsdk.windows.devices.enumeration import DeviceInformation
+    from winrt.windows.devices.bluetooth.rfcomm import RfcommDeviceService, RfcommServiceId
+    from winrt.windows.devices.enumeration import DeviceInformation
 
     selector = RfcommDeviceService.get_device_selector(RfcommServiceId.from_uuid(BTCHAT_SERVICE_UUID))
     try:
-        devices = await asyncio.wait_for(DeviceInformation.find_all_async(selector), timeout=timeout)
+        devices = await asyncio.wait_for(DeviceInformation.find_all_async_aqs_filter(selector), timeout=timeout)
     except asyncio.TimeoutError:
         return []
 
@@ -60,7 +60,7 @@ async def pair_device(device_id: str) -> bool:
     there's no second screen involved for a same-app chat pairing;
     Windows itself still shows its own confirmation dialog to the user.
     """
-    from winsdk.windows.devices.enumeration import (
+    from winrt.windows.devices.enumeration import (
         DeviceInformation, DevicePairingKinds, DevicePairingResultStatus,
     )
 
