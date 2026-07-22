@@ -42,7 +42,7 @@ from protocol import Envelope, make_hello, make_ack, MessageType
 BTCHAT_SERVICE_UUID = uuid.UUID("23e1f6c4-2eb5-4a0a-9614-6f0b1a6db2cd")
 BTCHAT_SERVICE_NAME = "BTChatService"
 
-POLL_INTERVAL = 1.0  # seconds; how often loops check for stop/cancel
+POLL_INTERVAL = 1.0  # seconds; how often the server-accept loop checks for stop
 
 
 def winrt_bluetooth_available() -> bool:
@@ -92,6 +92,7 @@ class BluetoothWorker(QThread):
 
         self._loop = None
         self._writer = None
+        self._sock = None
         self._stopped = False
         self._peer_label = target_name or target_mac or "peer"
 
@@ -104,7 +105,20 @@ class BluetoothWorker(QThread):
             self.error.emit(f"Bluetooth error: {e}")
 
     def stop(self):
+        """
+        Ask the worker to stop. Closing the socket (if we have one) is
+        what actually unblocks a pending reader.load_async() call in
+        _handle_socket - without this, stop() only takes effect the next
+        time the read loop naturally wakes up, which for a blocking read
+        may be "never" until the peer sends something.
+        """
         self._stopped = True
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     async def _async_main(self):
         self._loop = asyncio.get_running_loop()
@@ -196,6 +210,8 @@ class BluetoothWorker(QThread):
     async def _handle_socket(self, sock):
         from winrt.windows.storage.streams import DataReader, DataWriter, ByteOrder, UnicodeEncoding
 
+        # Keep a reference so stop() can close it to unblock a pending read.
+        self._sock = sock
         self._writer = DataWriter(sock.output_stream)
         reader = DataReader(sock.input_stream)
         reader.byte_order = ByteOrder.BIG_ENDIAN
@@ -204,12 +220,19 @@ class BluetoothWorker(QThread):
         self.connected.emit(self._peer_label)
         await self._send_envelope(make_hello(self.local_id, self.display_name))
 
+        closed_reason = "connection closed"
         try:
             while not self._stopped:
-                try:
-                    loaded = await asyncio.wait_for(reader.load_async(4), timeout=POLL_INTERVAL)
-                except asyncio.TimeoutError:
-                    continue
+                # IMPORTANT: await this directly - do NOT wrap it in
+                # asyncio.wait_for()/timeout. A DataReader only allows one
+                # outstanding load_async() at a time; cancelling this await
+                # via a timeout abandons the underlying WinRT operation
+                # without truly stopping it, so the *next* load_async() call
+                # collides with it and the runtime tears down the stream,
+                # which shows up as WinError -2147483629 (RO_E_CLOSED).
+                # To stop this loop on demand, stop() closes the socket
+                # instead, which makes this await return/raise immediately.
+                loaded = await reader.load_async(4)
                 if not loaded:
                     break  # peer closed the connection
                 length = reader.read_uint32()
@@ -220,13 +243,19 @@ class BluetoothWorker(QThread):
                 reader.read_bytes(raw)
                 self._handle_incoming_bytes(bytes(raw))
         except Exception as e:  # noqa: BLE001
-            self.error.emit(f"Connection error: {e}")
+            # If we asked for the socket to be closed (via stop()), this
+            # exception is expected - it's just the read unblocking. Only
+            # report it as a real error if we didn't request the close.
+            if not self._stopped:
+                self.error.emit(f"Connection error: {e}")
+                closed_reason = "connection error"
         finally:
             try:
                 sock.close()
             except Exception:
                 pass
-            self.disconnected.emit("connection closed")
+            self._sock = None
+            self.disconnected.emit(closed_reason)
 
     def _handle_incoming_bytes(self, raw: bytes):
         import json
