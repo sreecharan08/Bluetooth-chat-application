@@ -60,11 +60,25 @@ async def pair_device(device_id: str) -> bool:
     there's no second screen involved for a same-app chat pairing;
     Windows itself still shows its own confirmation dialog to the user.
     """
+    from winrt.windows.devices.bluetooth.rfcomm import RfcommDeviceService
     from winrt.windows.devices.enumeration import (
-        DeviceInformation, DevicePairingKinds, DevicePairingResultStatus,
+        DevicePairingKinds, DevicePairingResultStatus,
     )
 
-    info = await DeviceInformation.create_from_id_async(device_id)
+    # device_id here is the id of the RFCOMM *service* instance (as
+    # returned by scan_for_btchat_devices), not of the underlying
+    # Bluetooth device. DeviceInformation.create_from_id_async(device_id)
+    # on that service id leaves `.pairing` unset (None), which is what
+    # caused "'NoneType' object has no attribute 'is_paired'". Pairing
+    # is a property of the *device*, so resolve the service first and
+    # go through its .device.device_information instead.
+    service = await RfcommDeviceService.from_id_async(device_id)
+    if service is None:
+        raise RuntimeError("Couldn't resolve that device - it may have gone offline.")
+
+    info = service.device.device_information
+    if info.pairing is None:
+        raise RuntimeError("This device doesn't support pairing.")
     if info.pairing.is_paired:
         return True
 
