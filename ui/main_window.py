@@ -11,9 +11,9 @@ from core import storage
 from core.transport import BluetoothWorker, winrt_bluetooth_available
 from core.discovery import DiscoveryWorker, PairWorker
 from core.protocol import Envelope, MessageType, make_text_message
-from . import theme
-from .widgets import ContactItemWidget, Avatar
-from .chat_widget import ChatWidget
+from ui import theme
+from ui.widgets import ContactItemWidget, Avatar
+from ui.chat_widget import ChatWidget
 
 DEVICE_ID_ROLE = Qt.ItemDataRole.UserRole
 DEVICE_NAME_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -182,7 +182,6 @@ class MainWindow(QMainWindow):
     def _build_chat_panel(self) -> QWidget:
         self.chat = ChatWidget()
         self.chat.message_submitted.connect(self._on_send)
-        self.chat.disconnect_clicked.connect(self._on_disconnect_clicked)
         return self.chat
 
     def _toggle_advanced(self):
@@ -361,11 +360,6 @@ class MainWindow(QMainWindow):
         self.connect_selected_btn.setEnabled(True)
         self.mac_connect_btn.setEnabled(True)
         self.listen_btn.setEnabled(True)
-
-    def _on_disconnect_clicked(self):
-        if self.worker:
-            self.chat.append_system("Disconnecting...")
-            self.worker.stop()
 
     # ---------------------------------------------------------------
     # Messaging
