@@ -1,8 +1,3 @@
 PyQt6>=6.6
 bleak>=0.21
-winrt-Windows.Devices.Bluetooth>=3.1
-winrt-Windows.Devices.Bluetooth.Rfcomm>=3.1
-winrt-Windows.Devices.Enumeration>=3.1
-winrt-Windows.Networking>=3.1
-winrt-Windows.Networking.Sockets>=3.1
-winrt-Windows.Storage.Streams>=3.1
+winsdk>=1.0.0b10
