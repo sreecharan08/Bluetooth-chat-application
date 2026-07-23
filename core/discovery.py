@@ -20,7 +20,7 @@ environment.
 import asyncio
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from transport import BTCHAT_SERVICE_UUID
+from .transport import BTCHAT_SERVICE_UUID
 
 
 async def scan_for_btchat_devices(timeout: float = 8.0):

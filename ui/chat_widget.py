@@ -14,6 +14,7 @@ from .widgets import Avatar, MessageBubble, SystemNotice
 
 class ChatWidget(QWidget):
     message_submitted = pyqtSignal(str)
+    disconnect_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,6 +45,13 @@ class ChatWidget(QWidget):
         name_col.addWidget(self.peer_name_label)
         name_col.addWidget(self.peer_status_label)
         header_layout.addLayout(name_col, stretch=1)
+
+        self.disconnect_button = QPushButton("Disconnect")
+        self.disconnect_button.setObjectName("DisconnectButton")
+        self.disconnect_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.disconnect_button.clicked.connect(self.disconnect_clicked.emit)
+        self.disconnect_button.setVisible(False)
+        header_layout.addWidget(self.disconnect_button)
 
         layout.addWidget(header)
 
@@ -97,6 +105,7 @@ class ChatWidget(QWidget):
         self.peer_status_label.setProperty("connected", "true" if connected else "false")
         self.peer_status_label.style().unpolish(self.peer_status_label)
         self.peer_status_label.style().polish(self.peer_status_label)
+        self.disconnect_button.setVisible(connected)
 
     def set_peer_name(self, name: str):
         self.peer_name_label.setText(name)

@@ -1,13 +1,13 @@
 """
 Bluetooth RFCOMM transport - WinRT edition.
 
-Plain AF_BLUETOOTH sockets (the old approach in this file) can only
-dial a device you already know the MAC address of - Windows won't let
-you enumerate/discover *services* that way. To get real "find nearby
-BTChat instances and connect" behavior, we need the WinRT Bluetooth
-APIs (Windows.Devices.Bluetooth.Rfcomm / Windows.Devices.Enumeration),
-which is exactly what Microsoft's own "Bluetooth Rfcomm Chat Sample"
-uses. We drive them from Python via the `winrt-*` packages.
+Plain AF_BLUETOOTH sockets can only dial a device you already know the
+MAC address of - Windows won't let you enumerate/discover *services*
+that way. To get real "find nearby BTChat instances and connect"
+behavior, we need the WinRT Bluetooth APIs
+(Windows.Devices.Bluetooth.Rfcomm / Windows.Devices.Enumeration), which
+is exactly what Microsoft's own "Bluetooth Rfcomm Chat Sample" uses. We
+drive them from Python via the `winsdk` package.
 
 Key facts this design relies on (from Microsoft's docs):
   - RfcommServiceProvider advertises a custom service (identified by
@@ -20,35 +20,47 @@ Key facts this design relies on (from Microsoft's docs):
     DeviceInformationPairing) for cases where Windows' security policy
     requires a bonded pair before it'll allow the connection.
 
+Connection lifecycle: a connection now stays open until either the
+user disconnects (or the app closes) or the peer goes out of range /
+closes the socket - there is no artificial timeout. Two things make
+that possible:
+  - The read loop waits on the actual pending read plus a "stop"
+    future, rather than repeatedly cancelling and re-issuing a timed
+    read every second. Constantly cancelling a live WinRT stream read
+    was the previous (buggy) design and is the likely cause of
+    connections dropping "after a while" even while idle.
+  - A lightweight PING/PONG keepalive runs every 20s so the OS/radio
+    doesn't treat a quiet-but-open chat as an idle link worth closing.
+
 All WinRT calls are async (awaitable). Since Bluetooth I/O can't run on
 the GUI thread, each BluetoothWorker runs its own asyncio event loop
 inside a QThread and reports back to the GUI via Qt signals (the only
 thread-safe way to touch widgets from a worker thread).
 
-IMPORTANT: The `winrt-*` packages are Windows-only and require Windows 10 1607+.
+IMPORTANT: `winsdk` is Windows-only and requires Windows 10 1607+.
 This module cannot be executed/tested outside Windows - it has been
 written to match Microsoft's documented API shapes as closely as
-possible but has NOT been run against real Bluetooth hardware. If you
-hit a traceback running this, send it back and it can be fixed fast.
+possible but has NOT been run against real Bluetooth hardware.
 """
 import asyncio
+import json
 import uuid
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from protocol import Envelope, make_hello, make_ack, MessageType
+from .protocol import Envelope, make_hello, make_ack, MessageType
 
 # Fixed UUID identifying "this is a BTChat instance". Both sides must
 # use the same value - do not change unless you rebuild both ends.
 BTCHAT_SERVICE_UUID = uuid.UUID("23e1f6c4-2eb5-4a0a-9614-6f0b1a6db2cd")
 BTCHAT_SERVICE_NAME = "BTChatService"
 
-POLL_INTERVAL = 1.0  # seconds; how often the server-accept loop checks for stop
+KEEPALIVE_INTERVAL = 20.0  # seconds between PINGs while idle
 
 
 def winrt_bluetooth_available() -> bool:
-    """Best-effort check that the winrt Bluetooth packages are importable."""
+    """Best-effort check that the winsdk package is importable here."""
     try:
-        import winrt.windows.devices.bluetooth.rfcomm  # noqa: F401
+        import winsdk.windows.devices.bluetooth.rfcomm  # noqa: F401
         return True
     except ImportError:
         return False
@@ -92,8 +104,8 @@ class BluetoothWorker(QThread):
 
         self._loop = None
         self._writer = None
-        self._sock = None
         self._stopped = False
+        self._stop_future = None  # created once the loop is running
         self._peer_label = target_name or target_mac or "peer"
 
     # ---- lifecycle -----------------------------------------------
@@ -106,22 +118,22 @@ class BluetoothWorker(QThread):
 
     def stop(self):
         """
-        Ask the worker to stop. Closing the socket (if we have one) is
-        what actually unblocks a pending reader.load_async() call in
-        _handle_socket - without this, stop() only takes effect the next
-        time the read loop naturally wakes up, which for a blocking read
-        may be "never" until the peer sends something.
+        Called from the GUI thread (e.g. the Disconnect button, or on
+        app close). Signals the worker's asyncio loop to unwind
+        cleanly - it does NOT force-close the socket from this thread,
+        since that isn't safe to do across threads with WinRT objects.
         """
         self._stopped = True
-        sock = self._sock
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._resolve_stop_future)
+
+    def _resolve_stop_future(self):
+        if self._stop_future is not None and not self._stop_future.done():
+            self._stop_future.set_result(True)
 
     async def _async_main(self):
         self._loop = asyncio.get_running_loop()
+        self._stop_future = self._loop.create_future()
         if self.mode == "listen":
             await self._run_server()
         else:
@@ -130,8 +142,8 @@ class BluetoothWorker(QThread):
     # ---- server (advertise + accept) ------------------------------
 
     async def _run_server(self):
-        from winrt.windows.devices.bluetooth.rfcomm import RfcommServiceProvider, RfcommServiceId
-        from winrt.windows.networking.sockets import StreamSocketListener, SocketProtectionLevel
+        from winsdk.windows.devices.bluetooth.rfcomm import RfcommServiceProvider, RfcommServiceId
+        from winsdk.windows.networking.sockets import StreamSocketListener, SocketProtectionLevel
 
         provider = await RfcommServiceProvider.create_async(RfcommServiceId.from_uuid(BTCHAT_SERVICE_UUID))
         listener = StreamSocketListener()
@@ -143,23 +155,22 @@ class BluetoothWorker(QThread):
                 self._loop.call_soon_threadsafe(got_connection.set_result, args.socket)
 
         token = listener.add_connection_received(on_connection_received)
+        sock = None
         try:
-            await listener.bind_service_name_with_protection_level_async(
+            await listener.bind_service_name_async(
                 provider.service_id.as_string(),
                 SocketProtectionLevel.BLUETOOTH_ENCRYPTION_ALLOW_NULL_AUTHENTICATION,
             )
             # radioDiscoverable=True: discoverable by nearby devices
             # without requiring a pre-existing OS pairing bond.
-            provider.start_advertising_with_radio_discoverability(listener, True)
+            provider.start_advertising(listener, True)
             self.listening.emit()
 
-            sock = None
-            while not self._stopped:
-                try:
-                    sock = await asyncio.wait_for(asyncio.shield(got_connection), timeout=POLL_INTERVAL)
-                    break
-                except asyncio.TimeoutError:
-                    continue
+            done, _pending = await asyncio.wait(
+                {got_connection, self._stop_future}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if got_connection in done and not self._stop_future.done():
+                sock = got_connection.result()
         finally:
             listener.remove_connection_received(token)
             try:
@@ -175,9 +186,9 @@ class BluetoothWorker(QThread):
     # ---- client (discover-and-dial or manual MAC) ------------------
 
     async def _run_client(self):
-        from winrt.windows.devices.bluetooth.rfcomm import RfcommDeviceService, RfcommServiceId
-        from winrt.windows.devices.bluetooth import BluetoothDevice
-        from winrt.windows.networking.sockets import StreamSocket, SocketProtectionLevel
+        from winsdk.windows.devices.bluetooth.rfcomm import RfcommDeviceService, RfcommServiceId
+        from winsdk.windows.devices.bluetooth import BluetoothDevice
+        from winsdk.windows.networking.sockets import StreamSocket, SocketProtectionLevel
 
         service = None
         if self.target_device_id:
@@ -198,7 +209,7 @@ class BluetoothWorker(QThread):
             raise RuntimeError("No target device specified.")
 
         sock = StreamSocket()
-        await sock.connect_with_protection_level_async(
+        await sock.connect_async(
             service.connection_host_name,
             service.connection_service_name,
             SocketProtectionLevel.BLUETOOTH_ENCRYPTION_ALLOW_NULL_AUTHENTICATION,
@@ -208,31 +219,34 @@ class BluetoothWorker(QThread):
     # ---- shared read/write loop -------------------------------------
 
     async def _handle_socket(self, sock):
-        from winrt.windows.storage.streams import DataReader, DataWriter, ByteOrder, UnicodeEncoding
+        from winsdk.windows.storage.streams import DataReader, DataWriter, ByteOrder
 
-        # Keep a reference so stop() can close it to unblock a pending read.
-        self._sock = sock
         self._writer = DataWriter(sock.output_stream)
         reader = DataReader(sock.input_stream)
         reader.byte_order = ByteOrder.BIG_ENDIAN
-        reader.unicode_encoding = UnicodeEncoding.UTF8
 
         self.connected.emit(self._peer_label)
         await self._send_envelope(make_hello(self.local_id, self.display_name))
 
-        closed_reason = "connection closed"
+        keepalive_task = asyncio.ensure_future(self._keepalive_loop())
+
         try:
             while not self._stopped:
-                # IMPORTANT: await this directly - do NOT wrap it in
-                # asyncio.wait_for()/timeout. A DataReader only allows one
-                # outstanding load_async() at a time; cancelling this await
-                # via a timeout abandons the underlying WinRT operation
-                # without truly stopping it, so the *next* load_async() call
-                # collides with it and the runtime tears down the stream,
-                # which shows up as WinError -2147483629 (RO_E_CLOSED).
-                # To stop this loop on demand, stop() closes the socket
-                # instead, which makes this await return/raise immediately.
-                loaded = await reader.load_async(4)
+                # A single pending read, waited on alongside the stop
+                # signal - NOT repeatedly cancelled/recreated. Cancelling
+                # a live WinRT stream read on a timer (the old design)
+                # is what was likely causing connections to drop on
+                # their own after a while.
+                read_task = asyncio.ensure_future(reader.load_async(4))
+                done, _pending = await asyncio.wait(
+                    {read_task, self._stop_future}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if self._stop_future.done():
+                    if not read_task.done():
+                        read_task.cancel()
+                    break
+
+                loaded = read_task.result()
                 if not loaded:
                     break  # peer closed the connection
                 length = reader.read_uint32()
@@ -243,26 +257,43 @@ class BluetoothWorker(QThread):
                 reader.read_bytes(raw)
                 self._handle_incoming_bytes(bytes(raw))
         except Exception as e:  # noqa: BLE001
-            # If we asked for the socket to be closed (via stop()), this
-            # exception is expected - it's just the read unblocking. Only
-            # report it as a real error if we didn't request the close.
-            if not self._stopped:
-                self.error.emit(f"Connection error: {e}")
-                closed_reason = "connection error"
+            self.error.emit(f"Connection error: {e}")
         finally:
+            keepalive_task.cancel()
             try:
                 sock.close()
             except Exception:
                 pass
-            self._sock = None
-            self.disconnected.emit(closed_reason)
+            self.disconnected.emit(
+                "you disconnected" if self._stopped else "connection lost - peer closed or went out of range"
+            )
+
+    async def _keepalive_loop(self):
+        """Sends a PING every KEEPALIVE_INTERVAL seconds so idle connections
+        aren't mistaken for dead ones by Windows' Bluetooth power management."""
+        try:
+            while not self._stopped:
+                await asyncio.sleep(KEEPALIVE_INTERVAL)
+                if self._stopped:
+                    break
+                await self._send_envelope(Envelope(type=MessageType.PING, sender_id=self.local_id))
+        except asyncio.CancelledError:
+            pass
 
     def _handle_incoming_bytes(self, raw: bytes):
-        import json
         try:
             envelope = Envelope.from_dict(json.loads(raw.decode("utf-8")))
         except (ValueError, KeyError):
             return
+
+        if envelope.type == MessageType.PING:
+            asyncio.run_coroutine_threadsafe(
+                self._send_envelope(Envelope(type=MessageType.PONG, sender_id=self.local_id)), self._loop
+            )
+            return
+        if envelope.type == MessageType.PONG:
+            return  # just keepalive traffic, nothing for the UI to do
+
         if envelope.type == MessageType.TEXT:
             asyncio.run_coroutine_threadsafe(
                 self._send_envelope(make_ack(self.local_id, envelope.msg_id)), self._loop

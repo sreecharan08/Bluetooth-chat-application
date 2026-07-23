@@ -141,6 +141,19 @@ QToolButton#IconButton:hover {{ background-color: {HOVER}; }}
     color: {GREEN_MED};
 }}
 
+QPushButton#DisconnectButton {{
+    background-color: transparent;
+    color: #d64545;
+    border: 1px solid #f0c4c4;
+    border-radius: 14px;
+    padding: 5px 14px;
+    font-size: 12px;
+    font-weight: 600;
+}}
+QPushButton#DisconnectButton:hover {{
+    background-color: #fdeeee;
+}}
+
 /* ---- Message list / canvas ---- */
 QListWidget#MessageList {{
     background-color: {CHAT_BG};
